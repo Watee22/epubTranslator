@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import json
 import pickle
 import argparse
+import tempfile
+import shutil
 
 # 加载环境变量
 load_dotenv()
@@ -24,12 +26,27 @@ load_dotenv()
 
 openai.api_key = os.getenv('API_KEY')
 openai.api_base = os.getenv('BASE_URL')
-model_name = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
+model_name = os.getenv('MODEL_NAME')
 
 # 用于保存翻译进度的文件名模板
 CHECKPOINT_FILE = "{}_translation_checkpoint.pkl"
 # 保存专有名词词典的文件名
 GLOSSARY_FILE = "{}_glossary.json"
+# 临时目录，用于存放导出的文件
+TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+# 永久性存储目录，用于保存翻译后的文件
+TRANSLATED_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "translated_files")
+
+# 确保临时目录和永久性存储目录存在
+os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(TRANSLATED_FILES_DIR, exist_ok=True)
+
+# 导入用于Excel处理的库
+try:
+    import pandas as pd
+except ImportError:
+    print("警告: pandas库未安装，无法导出Excel文件")
+    pd = None
 
 def load_common_words(file_path='./commonwords/google-10000-english.txt'):
     """从文件中加载常用词列表"""
@@ -97,7 +114,7 @@ def is_valid_term(term):
     # 可能是有意义的专有名词
     return True
 
-def extract_terms(input_epub):
+def extract_terms(input_epub, export_excel=False):
     """从EPUB文件中提取可能的专有名词、人名、地名等"""
     print("开始提取专有名词...")
     book = epub.read_epub(input_epub)
@@ -119,115 +136,191 @@ def extract_terms(input_epub):
                 if is_valid_term(term):
                     terms.add(term)
     
-    print(f"提取了 {len(terms)} 个可能的专有名词")
-    return sorted(list(terms))
+    sorted_terms = sorted(list(terms))
+    print(f"提取了 {len(sorted_terms)} 个可能的专有名词")
+    
+    # 如果需要导出Excel，生成Excel文件并返回文件路径
+    excel_path = None
+    if export_excel and sorted_terms:
+        base_name = os.path.splitext(os.path.basename(input_epub))[0]
+        excel_path = export_terms_to_excel(sorted_terms, base_filename=base_name)
+    
+    return sorted_terms, excel_path
 
-def translate_text(text, glossary=None):
+def translate_text(text, glossary=None, max_retries=3):
     # 先检查词汇表中是否有对应的翻译
     if glossary and text in glossary:
         print(f"使用词汇表翻译: {text} -> {glossary[text]}")
         return TranslationResult(True, 0, glossary[text])
     
-    # 调用OpenAI的API进行翻译
-    try:
-        if (check_string(text)==False):
-            print("不需要翻译！")
-            return TranslationResult(True, 0, text)
+    # 预处理：在发送前替换文本中的术语
+    preprocessed_text = text
+    if glossary:
+        # 按长度排序术语，优先替换长词，避免部分替换问题
+        sorted_terms = sorted(glossary.items(), key=lambda x: len(x[0]), reverse=True)
+        replaced_terms = []
         
-        # 根据API类型选择不同的请求方式
-        if os.getenv('API_TYPE') == 'azure':
-            response = openai.ChatCompletion.create(
-                deployment_id=deployment_id,
-                messages=[
-                    {
-                        "role":"system",
-                        "content":"Starting now, you are an English translator. You will not engage in any conversation with me; you will only translate my words from English to Chinese. You will return a pure translation result, without adding anything else, including Chinese pinyin."},
-                    {
-                        "role": "user", 
-                        "content": f"{text}"
-                    }
-                ],
-                max_tokens=256,
-                temperature=0.0,
-                request_timeout = 10            
-            )
-        else:
+        for term, translation in sorted_terms:
+            if term in preprocessed_text:
+                # 简单字符串替换
+                preprocessed_text = preprocessed_text.replace(term, translation)
+                replaced_terms.append(f"{term} -> {translation}")
+        
+        if replaced_terms:
+            print(f"预处理替换了 {len(replaced_terms)} 个术语: {', '.join(replaced_terms[:3])}")
+            if len(replaced_terms) > 3:
+                print(f"...等共 {len(replaced_terms)} 个术语")
+    
+    # 调用OpenAI的API进行翻译，添加重试机制
+    retries = 0
+    while retries <= max_retries:
+        try:
+            if (check_string(preprocessed_text)==False):
+                print("不需要翻译！")
+                return TranslationResult(True, 0, text)
+            
             response = openai.ChatCompletion.create(
                 model=model_name,
                 messages=[
                     {
                         "role":"system",
-                        "content":"Starting now, you are an English translator. You will not engage in any conversation with me; you will only translate my words from English to Chinese. You will return a pure translation result, without adding anything else, including Chinese pinyin."},
+                        "content":"Starting now, you are an English translator. You will not engage in any conversation with me; you will only translate my words from English to Chinese. You will return a pure translation result, without adding anything else, including Chinese pinyin."
+                    },
                     {
                         "role": "user", 
-                        "content": f"{text}"
+                        "content": f"{preprocessed_text}"
                     }
                 ],
-                max_tokens=256,
+                max_tokens=1024,
                 temperature=0.0,
-                request_timeout = 10            
+                request_timeout=30,  # 增加超时时间到30秒
             )
+                
+            if (response==None):
+                print("翻译失败！")
+                return text
             
-        if (response==None):
-            print("翻译失败！")
-            return text
-        translated_text = response.choices[0].message['content']
-        return TranslationResult(True, 0, translated_text)
-    except Exception as e:
-        print("发生异常：", e)
-        traceback.print_exc()
-        return TranslationResult(False, 1001, None)
-    
-def translate_html(text, glossary=None):
+            translated_text = response.choices[0].message['content']
+            
+            # 每个请求后休息3秒，避免请求过于频繁
+            time.sleep(3)
+            
+            return TranslationResult(True, 0, translated_text)
+            
+        except Exception as e:
+            print("发生异常：", e)
+            error_msg = str(e).lower()
+            # 判断是否为超时异常
+            if "timeout" in error_msg or "timed out" in error_msg:
+                retries += 1
+                if retries <= max_retries:
+                    wait_time = 5  # 超时后等待5秒
+                    print(f"请求超时，等待{wait_time}秒后重试 ({retries}/{max_retries})...")
+                    time.sleep(wait_time)
+                    continue  # 继续下一次重试
+                else:
+                    print(f"超过最大重试次数 ({max_retries})，放弃翻译")
+            
+            traceback.print_exc()
+            return TranslationResult(False, 1001, None)
+
+def translate_html(text, glossary=None, max_retries=3):
     # 先检查词汇表中是否有对应的翻译
     if glossary and text in glossary:
         print(f"使用词汇表翻译HTML: {text} -> {glossary[text]}")
         return TranslationResult(True, 0, glossary[text])
     
-    # 调用OpenAI的API进行翻译
-    try:
-        if (check_string(text)==False):
-            print("不需要翻译！")
-            return TranslationResult(True, 0, text)
-        response = openai.ChatCompletion.create(
-            messages=[
-                {
-                    "role":"system",
-                    "content":"我将发一段HTML代码给你，其中包含了英文文本，请根据具体情况翻译英文文本到中文，维持原有HTML格式。如果翻译会破坏原有格式，请不做任何处理原样发回。"},
-                {
-                    "role": "user", 
-                    "content": f"{text}"
-                }
-            ],
-            max_tokens=256,
-            temperature=0.0,
-            request_timeout = 10            
-        )
-        response = openai.ChatCompletion.create(
-            model=model_name,
-            messages=[
-                {
-                    "role":"system",
-                    "content":"我将发一段HTML代码给你，其中包含了英文文本，请根据具体情况翻译英文文本到中文，维持原有HTML格式。如果翻译会破坏原有格式，请不做任何处理原样发回。"},
-                {
-                    "role": "user", 
-                    "content": f"{text}"
-                }
-            ],
-            max_tokens=256,
-            temperature=0.0,
-            request_timeout = 10            
-        )
-        
-        if (response==None):
-            print("翻译失败！")
-            return text
-        translated_text = response.choices[0].message['content']
-        return TranslationResult(True, 0, translated_text)
-    except Exception as e:
-        print("发生异常：", e)
-        traceback.print_exc()
-        return TranslationResult(False, 1001, None)
+    # 预处理：替换HTML中的术语
+    preprocessed_text = text
+    if glossary:
+        try:
+            # 解析HTML
+            soup = BeautifulSoup(text, 'html.parser')
+            
+            # 处理所有文本节点
+            def process_text_nodes(node):
+                if isinstance(node, NavigableString):
+                    text_content = str(node)
+                    modified = False
+                    
+                    # 按长度排序术语，优先替换长词
+                    sorted_terms = sorted(glossary.items(), key=lambda x: len(x[0]), reverse=True)
+                    
+                    for term, translation in sorted_terms:
+                        if term in text_content:
+                            text_content = text_content.replace(term, translation)
+                            modified = True
+                            print(f"在HTML中替换术语: {term} -> {translation}")
+                    
+                    if modified:
+                        node.replace_with(text_content)
+                else:
+                    # 递归处理子节点
+                    for child in list(node.children):
+                        process_text_nodes(child)
+            
+            # 处理HTML中的文本节点
+            process_text_nodes(soup)
+            
+            # 将修改后的HTML转换回字符串
+            preprocessed_text = str(soup)
+        except Exception as e:
+            print(f"处理HTML中的术语时出错: {e}")
+            # 如果出错，继续使用原始的text
+            preprocessed_text = text
+    
+    # 调用OpenAI的API进行翻译，添加重试机制
+    retries = 0
+    while retries <= max_retries:
+        try:
+            if (check_string(preprocessed_text)==False):
+                print("不需要翻译！")
+                return TranslationResult(True, 0, text)
+            
+            response = openai.ChatCompletion.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role":"system",
+                        "content":"我将发一段HTML代码给你，其中包含了英文文本，请根据具体情况翻译英文文本到中文，维持原有HTML格式。如果翻译会破坏原有格式，请不做任何处理原样发回。"
+                    },
+                    {
+                        "role": "user", 
+                        "content": f"{preprocessed_text}"
+                    }
+                ],
+                max_tokens=1024,
+                temperature=0.0,
+                request_timeout=30  # 增加超时时间到30秒
+            )
+            
+            if (response==None):
+                print("翻译失败！")
+                return text
+                
+            translated_text = response.choices[0].message['content']
+            
+            # 每个请求后休息3秒，避免请求过于频繁
+            time.sleep(3)
+            
+            return TranslationResult(True, 0, translated_text)
+            
+        except Exception as e:
+            print("发生异常：", e)
+            error_msg = str(e).lower()
+            # 判断是否为超时异常
+            if "timeout" in error_msg or "timed out" in error_msg:
+                retries += 1
+                if retries <= max_retries:
+                    wait_time = 5  # 超时后等待5秒
+                    print(f"HTML请求超时，等待{wait_time}秒后重试 ({retries}/{max_retries})...")
+                    time.sleep(wait_time)
+                    continue  # 继续下一次重试
+                else:
+                    print(f"HTML超过最大重试次数 ({max_retries})，放弃翻译")
+            
+            traceback.print_exc()
+            return TranslationResult(False, 1001, None)
 
 def update_epub_title(epub_path, new_title):
     # 读取epub文件
@@ -371,7 +464,8 @@ def save_checkpoint(checkpoint_data, input_file):
         pickle.dump(checkpoint_data, f)
     print(f"已保存断点，已完成项 {checkpoint_data['completed_items']} 个")
 
-def translate_epub(input_epub, output_epub, num_threads=5, user_glossary=None, resume=True):
+def translate_epub(input_epub, num_threads=5, user_glossary=None, resume=True):
+    output_epub = input_epub.replace('.epub', '_cn.epub')
     try:
         # 加载或创建词汇表
         glossary = load_glossary(input_epub, user_glossary)
@@ -471,6 +565,31 @@ def translate_epub(input_epub, output_epub, num_threads=5, user_glossary=None, r
             if os.path.exists(checkpoint_file):
                 os.remove(checkpoint_file)
                 print("翻译完成，已删除断点文件")
+        
+        # 将翻译好的文件复制到TMP_DIR目录
+        tmp_output_path = None
+        translated_file_path = None
+        if os.path.exists(output_epub) and all_tasks_completed:
+            try:
+                # 创建目标文件名
+                base_name = os.path.splitext(os.path.basename(input_epub))[0]
+                # 临时目录版本
+                tmp_file_name = f"{base_name}_cn_{int(time.time())}.epub"
+                tmp_output_path = os.path.join(TMP_DIR, tmp_file_name)
+                
+                # 永久存储版本 
+                perm_file_name = f"{base_name}_cn_{int(time.time())}.epub"
+                translated_file_path = os.path.join(TRANSLATED_FILES_DIR, perm_file_name)
+                
+                # 复制文件到两个位置
+                shutil.copy2(output_epub, translated_file_path)
+                print(f"已将翻译结果保存到永久目录: {translated_file_path}")
+            except Exception as e:
+                print(f"复制文件时出错: {e}")
+                traceback.print_exc()
+                
+        # 返回输出文件路径、临时目录路径和永久存储路径
+        return output_epub, tmp_output_path, translated_file_path
                 
     except KeyboardInterrupt:
         print("主线程侦测到Ctrl+C，正在退出...")
@@ -480,6 +599,94 @@ def translate_epub(input_epub, output_epub, num_threads=5, user_glossary=None, r
             queue.put(None)
         for thread in threads:
             thread.join()
+        return output_epub, None, None
+
+def export_glossary_to_excel(glossary, base_filename=None):
+    """
+    将词汇表导出为Excel文件，保存在临时目录中
+    
+    参数:
+        glossary (dict): 包含专有名词及其翻译的字典
+        base_filename (str, optional): 基础文件名，如果未提供则使用默认名称
+        
+    返回:
+        str: 保存的Excel文件的完整路径
+    """
+    if pd is None:
+        print("错误: 无法导出Excel文件，pandas库未安装")
+        return None
+        
+    try:
+        # 创建文件名
+        if base_filename:
+            filename = f"{base_filename}_glossary.xlsx"
+        else:
+            filename = f"glossary_{int(time.time())}.xlsx"
+            
+        # 完整文件路径
+        file_path = os.path.join(TMP_DIR, filename)
+        
+        # 创建DataFrame
+        df = pd.DataFrame({
+            "专有名词": list(glossary.keys()),
+            "中文翻译": list(glossary.values())
+        })
+        
+        # 保存为Excel
+        df.to_excel(file_path, index=False, engine="openpyxl")
+        
+        print(f"词汇表已导出为Excel: {file_path}")
+        return file_path
+    except Exception as e:
+        print(f"导出Excel文件时出错: {e}")
+        traceback.print_exc()
+        return None
+        
+def export_terms_to_excel(terms, translations=None, base_filename=None):
+    """
+    将提取的专有名词列表导出为Excel文件，可选添加已有的翻译
+    
+    参数:
+        terms (list): 专有名词列表
+        translations (dict, optional): 已有的翻译字典
+        base_filename (str, optional): 基础文件名，如果未提供则使用默认名称
+        
+    返回:
+        str: 保存的Excel文件的完整路径
+    """
+    if pd is None:
+        print("错误: 无法导出Excel文件，pandas库未安装")
+        return None
+        
+    try:
+        # 创建文件名
+        if base_filename:
+            filename = f"{base_filename}_terms.xlsx"
+        else:
+            filename = f"terms_{int(time.time())}.xlsx"
+            
+        # 完整文件路径
+        file_path = os.path.join(TMP_DIR, filename)
+        
+        # 准备数据
+        translations_dict = translations or {}
+        data = {
+            "专有名词": terms,
+            "中文翻译": [translations_dict.get(term, "") for term in terms]
+        }
+        
+        # 创建DataFrame
+        df = pd.DataFrame(data)
+        
+        # 保存为Excel
+        df.to_excel(file_path, index=False, engine="openpyxl")
+        
+        print(f"专有名词已导出为Excel: {file_path}")
+        return file_path
+    except Exception as e:
+        print(f"导出Excel文件时出错: {e}")
+        traceback.print_exc()
+        return None
 
 if __name__ == '__main__':
     # 创建命令行参数解析器
@@ -490,6 +697,8 @@ if __name__ == '__main__':
     parser.add_argument('--glossary', '-g', help='使用的词汇表文件路径 (JSON 格式)')
     parser.add_argument('--no-resume', action='store_true', help='禁用断点续传')
     parser.add_argument('--extract-terms', action='store_true', help='仅提取专有名词并保存')
+    parser.add_argument('--export-excel', action='store_true', help='导出专有名词为Excel格式')
+    parser.add_argument('--export-glossary', action='store_true', help='导出当前词汇表为Excel格式')
     
     args = parser.parse_args()
     
@@ -503,13 +712,15 @@ if __name__ == '__main__':
     
     # 如果只是提取专有名词
     if args.extract_terms:
-        terms = extract_terms(input_file)
+        terms, excel_path = extract_terms(input_file, export_excel=args.export_excel)
         # 保存为 JSON 文件
         base_name = os.path.splitext(os.path.basename(input_file))[0]
         terms_file = f"{base_name}_terms.json"
         with open(terms_file, 'w', encoding='utf-8') as f:
             json.dump(terms, f, ensure_ascii=False, indent=2)
         print(f"已提取 {len(terms)} 个可能的专有名词并保存到 {terms_file}")
+        if excel_path:
+            print(f"已导出专有名词到Excel: {excel_path}")
         sys.exit(0)
     
     # 加载词汇表（如果提供）
@@ -519,10 +730,28 @@ if __name__ == '__main__':
             with open(args.glossary, 'r', encoding='utf-8') as f:
                 user_glossary = json.load(f)
             print(f"已加载词汇表，包含 {len(user_glossary)} 个词条")
+            
+            # 如果需要导出词汇表为Excel
+            if args.export_glossary and user_glossary:
+                base_name = os.path.splitext(os.path.basename(args.glossary))[0]
+                excel_path = export_glossary_to_excel(user_glossary, base_name)
+                if excel_path:
+                    print(f"已导出词汇表到Excel: {excel_path}")
+                    
         except Exception as e:
             print(f"加载词汇表出错: {e}")
             sys.exit(1)
     
     print("开始翻译...")
-    translate_epub(input_file, output_file, num_threads=args.threads, 
+    translate_result = translate_epub(input_file, output_file, num_threads=args.threads, 
                   user_glossary=user_glossary, resume=not args.no_resume)
+    
+    # 解包返回值
+    output_path, tmp_output_path, translated_file_path = translate_result
+    
+    print("翻译完成！")
+    print(f"输出文件: {output_path}")
+    if tmp_output_path:
+        print(f"临时目录文件: {tmp_output_path}")
+    if translated_file_path:
+        print(f"永久存储文件: {translated_file_path}")

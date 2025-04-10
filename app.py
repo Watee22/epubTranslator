@@ -3,8 +3,21 @@ import os
 import json
 import pandas as pd
 import tempfile
-from epubtranslator import translate_epub, extract_terms, load_glossary
+from epubtranslator import translate_epub, extract_terms, load_glossary, export_glossary_to_excel, TRANSLATED_FILES_DIR
 import threading
+import shutil
+from dotenv import load_dotenv
+import openai
+load_dotenv()
+
+# 设置OpenAI的API密钥
+# 通过环境变量读取配置信息
+
+
+openai.api_key = os.getenv('API_KEY')
+openai.api_base = os.getenv('BASE_URL')
+model_name = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
+
 
 st.set_page_config(page_title="EPUB 翻译器", page_icon="📚", layout="wide")
 
@@ -39,7 +52,8 @@ if uploaded_file is not None:
         # 提取专有名词的按钮
         if st.button("从 EPUB 中提取专有名词"):
             with st.spinner("正在提取专有名词..."):
-                terms = extract_terms(input_path)
+                # 提取专有名词并直接导出为Excel
+                terms, excel_path = extract_terms(input_path, export_excel=True)
                 
                 # 将提取的词条显示在表格中
                 if terms:
@@ -64,9 +78,18 @@ if uploaded_file is not None:
                     # 提供下载按钮
                     col1, col2 = st.columns(2)
                     
+                    # 初始化会话状态变量
+                    if "excel_path" not in st.session_state:
+                        st.session_state.excel_path = excel_path
+                    else:
+                        st.session_state.excel_path = excel_path
+                        
+                    if "json_path" not in st.session_state:
+                        st.session_state.json_path = None
+                    
                     # JSON 下载按钮
                     with col1:
-                        if st.button("下载词汇表为 JSON"):
+                        if st.button("生成JSON词汇表", key="generate_json_btn"):
                             # 创建词汇表字典
                             glossary = {row["专有名词"]: row["中文翻译"] for _, row in edited_df.iterrows() if row["中文翻译"]}
                             # 保存为 JSON
@@ -75,40 +98,57 @@ if uploaded_file is not None:
                             with open(glossary_path, "w", encoding="utf-8") as f:
                                 json.dump(glossary, f, ensure_ascii=False, indent=2)
                             
-                            # 提供下载链接
-                            with open(glossary_path, "r", encoding="utf-8") as f:
+                            # 保存文件路径到会话状态
+                            st.session_state.json_path = glossary_path
+                            st.success(f"JSON文件已生成，包含 {len(glossary)} 个词条")
+                            
+                        # 如果已生成JSON文件，提供下载按钮
+                        if st.session_state.json_path and os.path.exists(st.session_state.json_path):
+                            with open(st.session_state.json_path, "r", encoding="utf-8") as f:
                                 st.download_button(
-                                    label="下载 JSON 文件",
+                                    label="下载JSON文件",
                                     data=f,
-                                    file_name=f"{base_name}_glossary.json",
-                                    mime="application/json"
+                                    file_name=os.path.basename(st.session_state.json_path),
+                                    mime="application/json",
+                                    key="download_json_file"
                                 )
                     
                     # Excel 下载按钮
                     with col2:
-                        if st.button("下载词汇表为 Excel"):
-                            # 保存为 Excel
-                            base_name = os.path.splitext(os.path.basename(input_path))[0]
-                            excel_path = os.path.join(temp_dir, f"{base_name}_glossary.xlsx")
-                            
-                            # 从数据框中保存非空翻译
-                            glossary_df = edited_df[edited_df["中文翻译"].notna() & (edited_df["中文翻译"] != "")]
-                            
-                            # 如果有空行也保留（全部保存）
-                            if len(glossary_df) == 0:
-                                glossary_df = edited_df
+                        # 如果已有Excel文件路径，直接提供下载按钮
+                        if st.session_state.excel_path and os.path.exists(st.session_state.excel_path):
+                            with open(st.session_state.excel_path, "rb") as f:
+                                file_data = f.read()
                                 
-                            # 保存为Excel
-                            glossary_df.to_excel(excel_path, index=False)
-                            
-                            # 提供下载链接
-                            with open(excel_path, "rb") as f:
-                                st.download_button(
-                                    label="下载 Excel 文件",
-                                    data=f,
-                                    file_name=f"{base_name}_glossary.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                )
+                            st.download_button(
+                                label="下载Excel文件",
+                                data=file_data,
+                                file_name=os.path.basename(st.session_state.excel_path),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="download_excel_file"
+                            )
+                            st.success(f"Excel文件已生成: {os.path.basename(st.session_state.excel_path)}")
+                        
+                        # 如果编辑后需要重新生成Excel
+                        if st.button("更新Excel词汇表", key="update_excel_btn"):
+                            try:
+                                # 从编辑后的DataFrame创建新的词汇表
+                                glossary = {row["专有名词"]: row["中文翻译"] for _, row in edited_df.iterrows() if pd.notna(row["中文翻译"])}
+                                
+                                if glossary:
+                                    # 使用epubtranslator的函数导出Excel
+                                    base_name = os.path.splitext(os.path.basename(input_path))[0]
+                                    excel_path = export_glossary_to_excel(glossary, base_name)
+                                    
+                                    if excel_path:
+                                        st.session_state.excel_path = excel_path
+                                        st.success(f"Excel文件已更新，包含 {len(glossary)} 条记录")
+                                else:
+                                    st.warning("没有找到有效的翻译内容，请先添加翻译")
+                            except Exception as e:
+                                st.error(f"更新Excel文件时出错: {str(e)}")
+                                import traceback
+                                st.code(traceback.format_exc())
                 else:
                     st.info("未找到专有名词")
                     
@@ -164,6 +204,73 @@ if uploaded_file is not None:
                         edited_glossary_df['专有名词'], 
                         edited_glossary_df['中文翻译']
                     ))
+
+                    # 初始化会话状态变量
+                    if "custom_excel_path" not in st.session_state:
+                        st.session_state.custom_excel_path = None
+                    if "custom_json_path" not in st.session_state:
+                        st.session_state.custom_json_path = None
+
+                    # 提供导出按钮
+                    col1, col2 = st.columns(2)
+                    
+                    # 导出到JSON
+                    with col1:
+                        if st.button("生成JSON词汇表", key="generate_custom_json"):
+                            try:
+                                # 保存为 JSON
+                                base_name = "custom_glossary"
+                                glossary_path = os.path.join(temp_dir, f"{base_name}.json")
+                                with open(glossary_path, "w", encoding="utf-8") as f:
+                                    json.dump(st.session_state.user_glossary, f, ensure_ascii=False, indent=2)
+                                
+                                # 保存到会话状态
+                                st.session_state.custom_json_path = glossary_path
+                                st.success(f"JSON文件已生成，包含 {len(st.session_state.user_glossary)} 个词条")
+                            except Exception as e:
+                                st.error(f"导出JSON文件时出错: {str(e)}")
+                                
+                        # 如果已生成文件，提供下载按钮
+                        if st.session_state.custom_json_path and os.path.exists(st.session_state.custom_json_path):
+                            with open(st.session_state.custom_json_path, "r", encoding="utf-8") as f:
+                                st.download_button(
+                                    label="下载JSON文件",
+                                    data=f,
+                                    file_name=os.path.basename(st.session_state.custom_json_path),
+                                    mime="application/json",
+                                    key="download_custom_json"
+                                )
+                    
+                    # 导出到Excel
+                    with col2:
+                        if st.button("生成Excel词汇表", key="generate_custom_excel"):
+                            try:
+                                # 使用epubtranslator的函数导出Excel
+                                excel_path = export_glossary_to_excel(st.session_state.user_glossary, "custom_glossary")
+                                
+                                if excel_path:
+                                    # 保存到会话状态
+                                    st.session_state.custom_excel_path = excel_path
+                                    st.success(f"Excel文件已生成，包含 {len(st.session_state.user_glossary)} 条记录")
+                                else:
+                                    st.error("导出Excel失败，请检查控制台日志")
+                            except Exception as e:
+                                st.error(f"导出Excel文件时出错: {str(e)}")
+                                import traceback
+                                st.code(traceback.format_exc())
+                                
+                        # 如果已生成文件，提供下载按钮
+                        if st.session_state.custom_excel_path and os.path.exists(st.session_state.custom_excel_path):
+                            with open(st.session_state.custom_excel_path, "rb") as f:
+                                file_data = f.read()
+                                
+                            st.download_button(
+                                label="下载Excel文件",
+                                data=file_data,
+                                file_name=os.path.basename(st.session_state.custom_excel_path),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="download_custom_excel"
+                            )
             except Exception as e:
                 st.error(f"读取词汇表出错: {str(e)}")
     
@@ -229,20 +336,50 @@ if uploaded_file is not None:
             def run_translation():
                 try:
                     # 开始翻译
-                    translate_epub(
+                    translate_result = translate_epub(
                         input_path, 
-                        output_path, 
                         num_threads=num_threads, 
                         user_glossary=user_glossary,
                         resume=resume_translation
                     )
+                    
+                    # 解包返回值
+                    output_path, tmp_output_path, translated_file_path = translate_result
+                    
                     # 更新状态
                     st.session_state.translation_status = "翻译完成"
                     st.session_state.translation_done = True
                     st.session_state.translation_progress = 1.0
+
+                    # 在翻译完成后立即尝试提供下载链接，不等待页面刷新
+                    if os.path.exists(output_path):
+                        try:
+                            # 将翻译完成的文件复制到一个新的位置来避免文件锁定问题
+                            final_output_path = os.path.join(temp_dir, "final_" + uploaded_file.name.replace('.epub', '_cn.epub'))
+                            shutil.copy2(output_path, final_output_path)
+                            st.session_state.final_output_path = final_output_path
+                            st.session_state.output_filename = uploaded_file.name.replace('.epub', '_cn.epub')
+                            print(f"翻译文件已保存到: {final_output_path}")
+                            
+                            # 如果有临时目录的路径，也保存下来
+                            if tmp_output_path and os.path.exists(tmp_output_path):
+                                st.session_state.tmp_output_path = tmp_output_path
+                                print(f"翻译文件也保存在临时目录: {tmp_output_path}")
+                                
+                            # 如果有永久存储的路径，保存下来
+                            if translated_file_path and os.path.exists(translated_file_path):
+                                st.session_state.translated_file_path = translated_file_path
+                                print(f"翻译文件也保存在永久目录: {translated_file_path}")
+                        except Exception as e:
+                            print(f"复制翻译结果时出错: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
                 except Exception as e:
                     st.session_state.translation_status = f"翻译失败: {str(e)}"
                     st.session_state.translation_done = True
+                    print(f"翻译过程出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
             
             # 启动翻译线程
             translate_thread = threading.Thread(target=run_translation)
@@ -256,14 +393,84 @@ if uploaded_file is not None:
             # 显示成功消息
             st.success("翻译已完成！")
             
-            # 提供下载链接
-            with open(output_path, "rb") as f:
-                st.download_button(
-                    label="下载翻译后的 EPUB",
-                    data=f,
-                    file_name=uploaded_file.name.replace('.epub', '_cn.epub'),
-                    mime="application/epub+zip"
-                )
+            # 检查文件是否存在并提供下载链接
+            if hasattr(st.session_state, "final_output_path") and os.path.exists(st.session_state.final_output_path):
+                try:
+                    with open(st.session_state.final_output_path, "rb") as f:
+                        file_data = f.read()
+                        
+                    st.download_button(
+                        label="下载翻译后的 EPUB",
+                        data=file_data,
+                        file_name=st.session_state.output_filename,
+                        mime="application/epub+zip",
+                        key="download_translated_epub"
+                    )
+                    
+                    # 显示文件信息和状态
+                    file_size = os.path.getsize(st.session_state.final_output_path) / 1024
+                    st.info(f"翻译文件已准备好: {st.session_state.output_filename} ({file_size:.2f} KB)")
+                except Exception as e:
+                    st.error(f"准备下载时出错: {str(e)}")
+                    # 提供备用方案
+                    st.warning(f"如果下载按钮不起作用，请在文件夹 {temp_dir} 中查找翻译后的文件")
+            else:
+                # 尝试直接从output_path读取
+                try:
+                    # 提供下载链接
+                    with open(output_path, "rb") as f:
+                        st.download_button(
+                            label="下载翻译后的 EPUB",
+                            data=f,
+                            file_name=uploaded_file.name.replace('.epub', '_cn.epub'),
+                            mime="application/epub+zip",
+                            key="download_original_path"
+                        )
+                except Exception as e:
+                    st.error(f"无法访问翻译文件: {str(e)}")
+                    st.warning(f"请手动从以下路径获取翻译文件: {output_path}")
+                    
+            # 如果有临时目录中的文件，也提供下载
+            if hasattr(st.session_state, "tmp_output_path") and os.path.exists(st.session_state.tmp_output_path):
+                try:
+                    with open(st.session_state.tmp_output_path, "rb") as f:
+                        file_data = f.read()
+                    
+                    tmp_filename = os.path.basename(st.session_state.tmp_output_path)
+                    st.download_button(
+                        label="从临时目录下载翻译后的 EPUB",
+                        data=file_data,
+                        file_name=tmp_filename,
+                        mime="application/epub+zip",
+                        key="download_tmp_epub"
+                    )
+                    
+                    # 显示临时文件的路径
+                    st.info(f"翻译文件保存在临时目录: {st.session_state.tmp_output_path}")
+                except Exception as e:
+                    st.error(f"访问临时目录文件时出错: {str(e)}")
+                    
+            # 如果有永久存储目录中的文件，提供下载
+            if hasattr(st.session_state, "translated_file_path") and os.path.exists(st.session_state.translated_file_path):
+                try:
+                    with open(st.session_state.translated_file_path, "rb") as f:
+                        file_data = f.read()
+                    
+                    perm_filename = os.path.basename(st.session_state.translated_file_path)
+                    st.download_button(
+                        label="从永久存储目录下载翻译后的 EPUB",
+                        data=file_data,
+                        file_name=perm_filename,
+                        mime="application/epub+zip",
+                        key="download_translated_file"
+                    )
+                    
+                    # 显示永久文件的路径和信息
+                    file_size = os.path.getsize(st.session_state.translated_file_path) / 1024
+                    st.success(f"翻译文件已永久保存在: {st.session_state.translated_file_path} ({file_size:.2f} KB)")
+                    st.success(f"所有翻译文件都保存在应用程序的 translated_files 目录下，路径: {TRANSLATED_FILES_DIR}")
+                except Exception as e:
+                    st.error(f"访问永久存储文件时出错: {str(e)}")
 else:
     # 如果没有上传文件，显示欢迎信息
     st.title("EPUB 翻译器")

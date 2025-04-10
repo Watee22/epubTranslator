@@ -8,3 +8,12 @@ __pycache__
 *.epub
 *.epub
 .env
+.tmp
+*.xlsx
+.pkl
+.json
+*.json
+*.pkl
+*.xlsx
+*.epub
+*.epub
