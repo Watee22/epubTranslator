@@ -27,7 +27,9 @@ load_dotenv()
 openai.api_key = os.getenv('API_KEY')
 openai.api_base = os.getenv('BASE_URL')
 model_name = os.getenv('MODEL_NAME')
-
+print(f"model_name: {model_name}")
+print(f"openai.api_key: {openai.api_key}")
+print(f"openai.api_base: {openai.api_base}")
 # 用于保存翻译进度的文件名模板
 CHECKPOINT_FILE = "{}_translation_checkpoint.pkl"
 # 保存专有名词词典的文件名
@@ -184,8 +186,8 @@ def translate_text(text, glossary=None, max_retries=3):
                 messages=[
                     {
                         "role":"system",
-                        "content":"Starting now, you are an English translator. You will not engage in any conversation with me; you will only translate my words from English to Chinese. You will return a pure translation result, without adding anything else, including Chinese pinyin."
-                    },
+                        "content":"从现在开始，您是一名翻译。你不会与我进行任何对话;你只会将我的话从英语翻译成中文，无论或长或短都翻译。您将返回纯翻译结果，无需添加任何其他内容与解释，包括中文拼音。"
+                    },  
                     {
                         "role": "user", 
                         "content": f"{preprocessed_text}"

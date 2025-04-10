@@ -16,7 +16,7 @@ load_dotenv()
 
 openai.api_key = os.getenv('API_KEY')
 openai.api_base = os.getenv('BASE_URL')
-model_name = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
+model_name = os.getenv('MODEL_NAME')
 
 
 st.set_page_config(page_title="EPUB 翻译器", page_icon="📚", layout="wide")
