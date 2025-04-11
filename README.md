@@ -56,9 +56,14 @@ streamlit run app.py
 
 ## License
 
-This project is for educational purposes.
+MIT
 
 ## Credits
 
-Uses the EpubTranslator module for EPUB file processing and translation.
+Modified the EpubTranslator module for EPUB file processing and translation.
+Used the common words list from `https://github.com/oprogramador/most-common-words-by-language`
 
+## TODO
+1.more languages
+2.docker development
+3.modifiable prompts
