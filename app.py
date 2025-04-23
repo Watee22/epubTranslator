@@ -75,6 +75,13 @@ with tab1:
     st.header("Upload EPUB file")
     uploaded_file = st.file_uploader("Choose an EPUB file", type="epub", key="translate_file")
     
+    # Book background information
+    st.subheader("Book Background (Optional)")
+    st.write("Provide background information about the book to improve translation quality")
+    book_background = st.text_area("Book background information", 
+                                 help="Enter information about the book's genre, setting, theme, etc. This helps the AI better understand the context for translation.",
+                                 height=150)
+    
     # Glossary upload (optional)
     st.subheader("Glossary (Optional)")
     glossary_format = st.radio("Glossary format:", ["JSON", "Excel"], horizontal=True)
@@ -110,6 +117,11 @@ with tab1:
             # Initialize translator
             translator = EpubTranslator(api_key=api_key, api_base=api_base, model_name=model_name)
             
+            # Set book background if provided
+            if book_background:
+                translator.book_background = book_background
+                st.info("Book background information added to translation context")
+            
             # Start translation in a way that allows progress updates
             status_text.text("Translation in progress...")
             
@@ -143,6 +155,14 @@ with tab2:
     st.header("Extract Terms from EPUB")
     term_file = st.file_uploader("Choose an EPUB file", type="epub", key="term_file")
     
+    # Book background information (optional)
+    st.subheader("Book Background (Optional)")
+    st.write("Provide background information about the book to help with term extraction")
+    term_book_background = st.text_area("Book background information", 
+                                     help="Enter information about the book's genre, setting, theme, etc.",
+                                     height=100,
+                                     key="term_background")
+    
     export_excel = st.checkbox("Export terms to Excel", value=True)
     
     if term_file and st.button("Extract Terms"):
@@ -151,6 +171,11 @@ with tab2:
         
         # Initialize translator
         translator = EpubTranslator(api_key=api_key, api_base=api_base, model_name=model_name)
+        
+        # Set book background if provided
+        if term_book_background:
+            translator.book_background = term_book_background
+            st.info("Book background information added to extraction context")
         
         try:
             with st.spinner("Extracting terms..."):

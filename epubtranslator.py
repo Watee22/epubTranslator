@@ -68,6 +68,9 @@ class EpubTranslator:
         
         # 初始化停止事件
         self.stop_event = threading.Event()
+        
+        # 书籍背景信息
+        self.book_background = None
 
     def load_common_words(self, file_path):
         """从文件中加载常用词列表"""
@@ -94,6 +97,34 @@ class EpubTranslator:
         match = re.search(r'[A-Za-z]', s)
         # 如果match不是None，则字符串是有效的
         return match is not None
+        
+    def contains_chinese(self, s):
+        """检查字符串中间及周围是否包含中文字符"""
+        if not s or len(s) < 3:  # 至少需要3个字符才有中间位置
+            return False
+            
+        # 找到字符串的中间位置
+        mid_point = len(s) // 2
+        
+        # 定义检查范围（向左和向右各检查几个字符）
+        check_range = min(15, len(s) // 2)  # 每个方向最多检查15个字符
+        
+        # 使用Unicode范围检查是否是中文字符
+        def is_chinese_char(char):
+            # 中文字符的Unicode范围
+            return '\u4e00' <= char <= '\u9fff'
+        
+        # 检查中间向左的字符
+        for i in range(max(0, mid_point - check_range), mid_point):
+            if is_chinese_char(s[i]):
+                return True
+                
+        # 检查中间向右的字符
+        for i in range(mid_point, min(len(s), mid_point + check_range)):
+            if is_chinese_char(s[i]):
+                return True
+                
+        return False
 
     def is_valid_term(self, term):
         """判断一个词组是否可能是一个有效的专有名词"""
@@ -157,6 +188,11 @@ class EpubTranslator:
 
     def translate_text(self, text, glossary=None, max_retries=3):
         """翻译文本，支持重试和术语替换"""
+        # 检查是否已包含中文，如果是则直接返回
+        if self.contains_chinese(text):
+            print("文本已包含中文，无需翻译！")
+            return TranslationResult(True, 0, text)
+            
         # 先检查词汇表中是否有对应的翻译
         if glossary and text in glossary:
             print(f"使用词汇表翻译: {text} -> {glossary[text]}")
@@ -188,12 +224,19 @@ class EpubTranslator:
                     print("不需要翻译！")
                     return TranslationResult(True, 0, text)
                 
+                # 创建系统提示，添加背景信息
+                system_prompt = "从现在开始，您是一名翻译。你不会与我进行任何对话;你只会将我的话从英语翻译成中文，无论或长或短都翻译。您将返回纯翻译结果，无需添加任何其他内容与解释，包括中文拼音。"
+                
+                # 如果有书籍背景信息，添加到系统提示中
+                if self.book_background:
+                    system_prompt += f"\n\n关于本书背景：{self.book_background}\n\n请根据上述背景信息进行专业、准确的翻译。"
+                
                 response = openai.ChatCompletion.create(
                     model=self.model_name,
                     messages=[
                         {
                             "role":"system",
-                            "content":"从现在开始，您是一名翻译。你不会与我进行任何对话;你只会将我的话从英语翻译成中文，无论或长或短都翻译。您将返回纯翻译结果，无需添加任何其他内容与解释，包括中文拼音。"
+                            "content": system_prompt
                         },  
                         {
                             "role": "user", 
@@ -235,6 +278,11 @@ class EpubTranslator:
 
     def translate_html(self, text, glossary=None, max_retries=3):
         """翻译HTML内容，支持重试和术语替换"""
+        # 检查是否已包含中文，如果是则直接返回
+        if self.contains_chinese(text):
+            print("HTML内容已包含中文，无需翻译！")
+            return TranslationResult(True, 0, text)
+            
         # 先检查词汇表中是否有对应的翻译
         if glossary and text in glossary:
             print(f"使用词汇表翻译HTML: {text} -> {glossary[text]}")
@@ -287,12 +335,19 @@ class EpubTranslator:
                     print("不需要翻译！")
                     return TranslationResult(True, 0, text)
                 
+                # 创建系统提示，添加背景信息
+                system_prompt = "我将发一段HTML代码给你，其中包含了英文文本，请根据具体情况翻译英文文本到中文，维持原有HTML格式。"
+                
+                # 如果有书籍背景信息，添加到系统提示中
+                if self.book_background:
+                    system_prompt += f"\n\n关于本书背景：{self.book_background}\n\n请根据上述背景信息进行专业、准确的翻译，同时保持HTML标签不变。"
+                
                 response = openai.ChatCompletion.create(
                     model=self.model_name,
                     messages=[
                         {
                             "role":"system",
-                            "content":"我将发一段HTML代码给你，其中包含了英文文本，请根据具体情况翻译英文文本到中文，维持原有HTML格式。"
+                            "content": system_prompt
                         },
                         {
                             "role": "user", 
@@ -372,20 +427,47 @@ class EpubTranslator:
         """翻译并保存EPUB项目"""
         if item.get_type() == 9:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
+            
+            # 处理段落标签
             p_list = soup.findAll("p")
-            if len(p_list) == 0:
+            if len(p_list) > 0:
+                for p in p_list:
+                    if self.stop_event.is_set():
+                        break
+                    print("翻前HTML (p)：", p)
+                    tresult = self.translate_html(str(p), glossary)
+                    if tresult.result:
+                        translated_text = tresult.data
+                        newtag = BeautifulSoup(translated_text, 'html.parser').p
+                        p.replace_with(newtag)
+                        print(f"翻后HTML (p)：{newtag}")
+            
+            # 处理引用标签
+            blockquote_list = soup.findAll("blockquote")
+            if len(blockquote_list) > 0:
+                print(f"发现 {len(blockquote_list)} 个引用块需要翻译")
+                for blockquote in blockquote_list:
+                    if self.stop_event.is_set():
+                        break
+                    # 获取原始class属性
+                    original_class = blockquote.get('class', [])
+                    print("翻前HTML (blockquote)：", blockquote)
+                    tresult = self.translate_html(str(blockquote), glossary)
+                    if tresult.result:
+                        translated_text = tresult.data
+                        # 创建新的blockquote标签
+                        new_blockquote = BeautifulSoup(translated_text, 'html.parser').blockquote
+                        # 确保保留原始class属性
+                        if original_class and not new_blockquote.get('class'):
+                            new_blockquote['class'] = original_class
+                        blockquote.replace_with(new_blockquote)
+                        print(f"翻后HTML (blockquote)：{new_blockquote}")
+            
+            # 如果既没有段落也没有引用，直接添加
+            if len(p_list) == 0 and len(blockquote_list) == 0:
                 new_book.add_item(item)
                 return
-            for p in p_list:
-                if self.stop_event.is_set():
-                    break
-                print("翻前HTML：",p)
-                tresult = self.translate_html(str(p), glossary)
-                if tresult.result:
-                    translated_text = tresult.data
-                    newtag = BeautifulSoup(translated_text,'html.parser').p
-                    p.replace_with(newtag)
-                    print(f"翻后HTML：{newtag}")
+                
             item.set_content(str(soup).encode('utf-8'))
         new_book.add_item(item)
         with lock:
@@ -457,6 +539,12 @@ class EpubTranslator:
                 with open(checkpoint_file, 'rb') as f:
                     checkpoint_data = pickle.load(f)
                     print(f"已加载断点，已完成项 {checkpoint_data['completed_items']} 个")
+                    
+                    # 恢复书籍背景信息，如果存在
+                    if 'book_background' in checkpoint_data and checkpoint_data['book_background']:
+                        self.book_background = checkpoint_data['book_background']
+                        print("已恢复书籍背景信息")
+                        
                     return checkpoint_data
             except Exception as e:
                 print(f"加载断点出错: {e}")
@@ -464,13 +552,17 @@ class EpubTranslator:
         return {
             'completed_items': 0,
             'processed_ids': set(),
-            'book_data': None
+            'book_data': None,
+            'book_background': self.book_background  # 保存书籍背景信息
         }
 
     def save_checkpoint(self, checkpoint_data, input_file):
         """保存翻译进度检查点"""
         base_name = os.path.splitext(os.path.basename(input_file))[0]
         checkpoint_file = self.CHECKPOINT_FILE.format(base_name)
+        
+        # 保存书籍背景信息
+        checkpoint_data['book_background'] = self.book_background
         
         with open(checkpoint_file, 'wb') as f:
             pickle.dump(checkpoint_data, f)
